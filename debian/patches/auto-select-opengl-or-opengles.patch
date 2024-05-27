@@ -1,0 +1,328 @@
+From 02484a9197c6ffb2ca5fd3c50e10774900aea465 Mon Sep 17 00:00:00 2001
+From: Jiajie Chen <c@jia.je>
+Date: Thu, 25 Apr 2024 05:31:42 -0700
+Subject: [PATCH 13/15] [Deepin] auto select opengl or opengles
+
+Adapt a patch from Linux Deepin to auto select GLES.
+
+The patch is modified to allow it to work on 5.15. Setting
+QT_XCB_GL_INTEGRATION=xcb_egl is necessary for it to work now.
+
+Tested on Lichee Pi 4A with PowerVR closed GLES driver (and llvmpipe as
+GLX driver).
+
+Signed-off-by: Icenowy Zheng <uwu@icenowy.me>
+---
+ .../xcb/gl_integrations/qxcbglintegration.cpp | 208 ++++++++++++++++++
+ .../xcb/gl_integrations/qxcbglintegration.h   |  20 ++
+ .../xcb_egl/qxcbeglintegration.cpp            |   5 +
+ .../gl_integrations/xcb_egl/qxcbeglwindow.cpp |   8 +-
+ .../xcb_glx/qglxintegration.cpp               |   4 +
+ .../src/plugins/platforms/xcb/xcb_qpa_lib.pro |   2 +-
+ 6 files changed, 245 insertions(+), 2 deletions(-)
+
+--- a/src/plugins/platforms/xcb/gl_integrations/qxcbglintegration.cpp
++++ b/src/plugins/platforms/xcb/gl_integrations/qxcbglintegration.cpp
+@@ -7,6 +7,214 @@
+ 
+ Q_LOGGING_CATEGORY(lcQpaGl, "qt.qpa.gl")
+ 
++#include <X11/Xlib.h>
++#include <GL/glx.h>
++#include <EGL/egl.h>
++
++int DetectOpenGLCapability::EGLtestGLESCapability()
++{
++     Display    *x_display;
++     Window      win;
++     EGLDisplay  egl_display;
++     EGLContext  egl_context;
++     EGLSurface  egl_surface;
++     EGLenum     current_api;
++
++     x_display = XOpenDisplay(nullptr);
++     if (x_display == nullptr) {
++         return 0;
++     }
++     Window root = DefaultRootWindow(x_display);
++     XSetWindowAttributes swa;
++     swa.event_mask = ExposureMask | PointerMotionMask | KeyPressMask;
++     win = XCreateWindow(x_display, root, 0, 0, 800, 480,   0,
++                                                  CopyFromParent, InputOutput,
++                                                  CopyFromParent, CWEventMask,
++                                                  &swa );
++     egl_display = eglGetDisplay((EGLNativeDisplayType)x_display);
++     if (egl_display == EGL_NO_DISPLAY ) {
++        XDestroyWindow(x_display, win);
++        XCloseDisplay(x_display);
++        return 0;
++     }
++     if (!eglInitialize(egl_display, nullptr, nullptr)) {
++        eglTerminate(egl_display);
++        XDestroyWindow(x_display, win);
++        XCloseDisplay(x_display);
++        return 0;
++     }
++     current_api = eglQueryAPI();
++     eglBindAPI(EGL_OPENGL_ES_API);
++     if (current_api == EGL_NONE) {
++        // do not support OpenGL ES at all
++        return 0;
++     }
++     EGLint attr[] = {       // some attributes to set up our egl-interface
++         EGL_BUFFER_SIZE, 16,
++         EGL_RENDERABLE_TYPE,
++         EGL_OPENGL_ES_BIT,
++         EGL_NONE
++     };
++     EGLConfig  ecfg;
++     EGLint     num_config;
++     if (!eglChooseConfig(egl_display, attr, &ecfg, 1, &num_config)) {
++        eglTerminate(egl_display);
++        XDestroyWindow(x_display, win);
++        XCloseDisplay(x_display);
++        return 0;
++     }
++     if (num_config != 1) {
++        eglTerminate(egl_display);
++        XDestroyWindow(x_display, win);
++        XCloseDisplay(x_display);
++        return 0;
++     }
++     egl_surface = eglCreateWindowSurface ( egl_display, ecfg, win, NULL );
++     if (egl_surface == EGL_NO_SURFACE) {
++        eglDestroySurface(egl_display, egl_surface);
++        eglTerminate(egl_display);
++        XDestroyWindow(x_display, win);
++        XCloseDisplay(x_display);
++        return 0;
++     }
++
++     EGLint ctxattr[] = {
++         EGL_CONTEXT_CLIENT_VERSION, 2,
++         EGL_NONE
++     };
++     egl_context = eglCreateContext (egl_display, ecfg, EGL_NO_CONTEXT, ctxattr);
++     if (egl_context == EGL_NO_CONTEXT) {
++        eglDestroySurface(egl_display, egl_surface);
++        eglTerminate(egl_display);
++        XDestroyWindow(x_display, win);
++        XCloseDisplay(x_display);
++        return 0;
++     }
++
++     eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context);
++     const QString strShadinglanguage = reinterpret_cast<const char *>(glGetString(GL_SHADING_LANGUAGE_VERSION));
++     const QString strVersion = reinterpret_cast<const char *>(glGetString(GL_VERSION));
++     const QString strRenderer = reinterpret_cast<const char *>(glGetString(GL_RENDERER));
++     eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++
++     eglDestroyContext(egl_display, egl_context);
++     eglDestroySurface(egl_display, egl_surface);
++     eglBindAPI(current_api);
++     eglTerminate(egl_display);
++     XDestroyWindow(x_display, win);
++     XCloseDisplay(x_display);
++
++    if (strVersion.isNull() || strRenderer.isEmpty() || strShadinglanguage.isEmpty())
++        return 0;
++    if (strVersion.contains(QStringLiteral("Mesa")) || strRenderer.contains(QStringLiteral("llvm")))
++        return 1;
++    else
++        return 2;
++}
++int DetectOpenGLCapability::GLXtestOpenGLCapability()
++{
++    Display *dpy;
++    Window root;
++    XVisualInfo *vi;
++    Colormap cmap;
++    XSetWindowAttributes swa;
++    Window win;
++    GLXFBConfig *fc;
++    GLXContext glc;
++    int att[] = {GLX_RENDER_TYPE, GLX_RGBA_BIT,
++              GLX_DOUBLEBUFFER, True,
++              GLX_DEPTH_SIZE, 16,
++              None};
++    int nelements;
++
++    dpy = XOpenDisplay(nullptr);
++
++    if (dpy == nullptr) {
++        return 0;
++    }
++
++    fc = glXChooseFBConfig(dpy, 0, att, &nelements);
++
++    if (fc == nullptr) {
++        XDestroyWindow(dpy, win);
++        XCloseDisplay(dpy);
++        return 0;
++    }
++
++    vi = glXGetVisualFromFBConfig(dpy, *fc);
++
++    if (vi == nullptr) {
++        XFree(fc);
++        XDestroyWindow(dpy, win);
++        XCloseDisplay(dpy);
++        return 0;
++    }
++
++    root = DefaultRootWindow(dpy);
++    cmap = XCreateColormap(dpy, root, vi->visual, AllocNone);
++
++    swa.colormap = cmap;
++    swa.event_mask = ExposureMask | KeyPressMask;
++    win = XCreateWindow(dpy, root, 0, 0, 1, 1,
++                 0, vi->depth,
++                 InputOutput, vi->visual,
++                 CWColormap | CWEventMask, &swa);
++
++    XMapWindow(dpy, win);
++
++    glc = glXCreateNewContext(dpy, *fc, GLX_RGBA_TYPE, nullptr, GL_TRUE);
++    if (!glc){
++        XFree(fc);
++        XFree(vi);
++        XDestroyWindow(dpy, win);
++        XCloseDisplay(dpy);
++        return 0;
++    }
++
++    glXMakeContextCurrent(dpy, win, win, glc);
++    const QString strShadinglanguage = reinterpret_cast<const char *>(glGetString(GL_SHADING_LANGUAGE_VERSION));
++    const QString strVersion = reinterpret_cast<const char *>(glGetString(GL_VERSION));
++    const QString strRenderer = reinterpret_cast<const char *>(glGetString(GL_RENDERER));
++    glXMakeCurrent(dpy, None, nullptr);
++
++    XFree(fc);
++    XFree(vi);
++    glXDestroyContext(dpy, glc);
++    XDestroyWindow(dpy, win);
++    XCloseDisplay(dpy);
++
++    if (strVersion.isNull() || strRenderer.isEmpty() || strShadinglanguage.isEmpty())
++        return 0;
++    if (strRenderer.contains(QStringLiteral("softpipe")) || strRenderer.contains(QStringLiteral("llvmpipe")))
++        return 1;
++    else
++        return 2;
++}
++
++DetectOpenGLCapability::DetectOpenGLCapability()
++{
++    m_renderableType = QSurfaceFormat::DefaultRenderableType;
++    //test opengl
++    int openglCap = GLXtestOpenGLCapability();
++    //test gles
++    int glesCap = EGLtestGLESCapability();
++    if (openglCap == 2) {
++        m_renderableType =  QSurfaceFormat::OpenGL;
++    }
++    else if (glesCap == 2){
++        m_renderableType =  QSurfaceFormat::OpenGLES;
++    }
++    else if (openglCap == 1) {
++        m_renderableType =  QSurfaceFormat::OpenGL;
++    }
++    else if (glesCap == 1){
++        m_renderableType =  QSurfaceFormat::OpenGLES;
++    }
++    else {
++        qWarning() << "this platform don't support GL";
++    }
++}
++
+ QXcbGlIntegration::QXcbGlIntegration()
+ {
+ }
+--- a/src/plugins/platforms/xcb/gl_integrations/qxcbglintegration.h
++++ b/src/plugins/platforms/xcb/gl_integrations/qxcbglintegration.h
+@@ -16,6 +16,26 @@
+ 
+ Q_DECLARE_EXPORTED_LOGGING_CATEGORY(lcQpaGl, Q_XCB_EXPORT)
+ 
++class Q_XCB_EXPORT DetectOpenGLCapability
++{
++public:
++    static DetectOpenGLCapability* instance()
++    {
++        static DetectOpenGLCapability openglCapability;
++        return &openglCapability;
++    }
++    QSurfaceFormat::RenderableType getOpenGLType()
++    {
++        return m_renderableType;
++    }
++private:
++    DetectOpenGLCapability();
++
++    int EGLtestGLESCapability();
++    int GLXtestOpenGLCapability();
++    QSurfaceFormat::RenderableType m_renderableType;
++};
++
+ class Q_XCB_EXPORT QXcbGlIntegration
+ {
+ public:
+--- a/src/plugins/platforms/xcb/gl_integrations/xcb_egl/qxcbeglintegration.cpp
++++ b/src/plugins/platforms/xcb/gl_integrations/xcb_egl/qxcbeglintegration.cpp
+@@ -122,6 +122,11 @@
+ 
+ QPlatformOpenGLContext *QXcbEglIntegration::createPlatformOpenGLContext(QOpenGLContext *context) const
+ {
++    QSurfaceFormat fmt = context->format();
++    if (fmt.renderableType() == QSurfaceFormat::DefaultRenderableType) {
++        fmt.setRenderableType(DetectOpenGLCapability::instance()->getOpenGLType());
++        context->setFormat(fmt);
++    }
+     QXcbScreen *screen = static_cast<QXcbScreen *>(context->screen()->handle());
+     QXcbEglContext *platformContext = new QXcbEglContext(screen->surfaceFormatFor(context->format()),
+                                                          context->shareHandle(),
+--- a/src/plugins/platforms/xcb/gl_integrations/xcb_egl/qxcbeglwindow.cpp
++++ b/src/plugins/platforms/xcb/gl_integrations/xcb_egl/qxcbeglwindow.cpp
+@@ -26,8 +26,14 @@
+     eglDestroySurface(m_glIntegration->eglDisplay(), m_surface);
+ }
+ 
+-void QXcbEglWindow::resolveFormat(const QSurfaceFormat &format)
++void QXcbEglWindow::resolveFormat(const QSurfaceFormat &f)
+ {
++    QSurfaceFormat format = f;
++
++    if (format.renderableType() == QSurfaceFormat::DefaultRenderableType) {
++        format.setRenderableType(DetectOpenGLCapability::instance()->getOpenGLType());
++    }
++
+     m_config = q_configFromGLFormat(m_glIntegration->eglDisplay(), format);
+     m_format = q_glFormatFromConfig(m_glIntegration->eglDisplay(), m_config, format);
+ }
+--- a/src/plugins/platforms/xcb/gl_integrations/xcb_glx/qglxintegration.cpp
++++ b/src/plugins/platforms/xcb/gl_integrations/xcb_glx/qglxintegration.cpp
+@@ -192,6 +192,11 @@
+     if (m_format.renderableType() == QSurfaceFormat::DefaultRenderableType)
+         m_format.setRenderableType(QOpenGLContext::openGLModuleType() == QOpenGLContext::LibGL
+                                    ? QSurfaceFormat::OpenGL : QSurfaceFormat::OpenGLES);
++
++    if (m_format.renderableType() == QSurfaceFormat::DefaultRenderableType) {
++        m_format.setRenderableType(DetectOpenGLCapability::instance()->getOpenGLType());
++    }
++
+     if (m_format.renderableType() != QSurfaceFormat::OpenGL && m_format.renderableType() != QSurfaceFormat::OpenGLES)
+         return;
+ 
+diff --git a/src/plugins/platforms/xcb/CMakeLists.txt b/src/plugins/platforms/xcb/CMakeLists.txt
+index 9322916d..6203f0e9 100644
+--- a/src/plugins/platforms/xcb/CMakeLists.txt
++++ b/src/plugins/platforms/xcb/CMakeLists.txt
+@@ -64,6 +64,8 @@ qt_internal_add_module(XcbQpaPrivate
+         XCB::XFIXES
+         XCB::XKB
+         XKB::XKB
++    LIBRARIES
++        EGL::EGL
+     NO_UNITY_BUILD # X11 define clashes
+ )
+ 

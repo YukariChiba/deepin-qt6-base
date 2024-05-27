@@ -1,3 +1,9 @@
+qt6-base (6.6.1+dfsg-5deepin4) unstable; urgency=medium
+
+  * add auto GLES selection
+
+ -- Chang Yang <yangchang@deepin.org>  Tue, 28 May 2024 11:07:32 +0800
+
 qt6-base (6.6.1+dfsg-5deepin3) unstable; urgency=medium
 
   * feat: Add QT_IM_MODULES env to allows specify multi IM key
