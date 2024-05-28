@@ -19,6 +19,11 @@ else
         extra_cmake_args += -DFEATURE_sctp=OFF
 endif
 
+# use gles2 for riscv64 since auto gles is not supported yet
+ifeq ($(DEB_BUILD_ARCH),riscv64)
+	extra_cmake_args += -DINPUT_opengl=es2
+endif
+
 # cross-builds
 ifneq ($(DEB_BUILD_ARCH),$(DEB_HOST_ARCH))
 	extra_cmake_args += \
